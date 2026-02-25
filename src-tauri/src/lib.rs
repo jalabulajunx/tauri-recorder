@@ -18,8 +18,8 @@ lazy_static::lazy_static! {
 #[cfg(windows)]
 mod windows_audio {
     use std::ptr::null_mut;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicPtr, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicPtr, AtomicOrdering};
+    use windows::core::Interface;
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
 
@@ -31,7 +31,7 @@ mod windows_audio {
         channels: u16,
     }
 
-    // Safety: We only access these pointers from one thread at a time
+    // Safety: We manage the raw pointers manually and only access them from one thread at a time
     unsafe impl Send for ThreadSafeCapture {}
     unsafe impl Sync for ThreadSafeCapture {}
 
@@ -75,7 +75,7 @@ mod windows_audio {
                         stream_flags,
                         duration,
                         0,
-                        Some(format_ptr),
+                        format_ptr,
                         None,
                     )
                     .map_err(|e| format!("Failed to initialize audio client: {}", e))?;
@@ -86,8 +86,8 @@ mod windows_audio {
                     .map_err(|e| format!("Failed to get capture client: {}", e))?;
 
                 // Store raw pointers
-                let audio_client_ptr = audio_client.as_raw();
-                let capture_client_ptr = capture_client.as_raw();
+                let audio_client_ptr = audio_client.as_raw() as *mut std::ffi::c_void;
+                let capture_client_ptr = capture_client.as_raw() as *mut std::ffi::c_void;
 
                 // Don't drop the COM objects - we'll manage them manually
                 std::mem::forget(audio_client);
@@ -109,7 +109,7 @@ mod windows_audio {
         pub fn start(&self) -> Result<(), String> {
             unsafe {
                 let ptr = self.audio_client.load(AtomicOrdering::SeqCst);
-                let audio_client = IAudioClient::from_raw(ptr);
+                let audio_client: IAudioClient = Interface::from_raw(ptr as *mut _);
                 audio_client
                     .Start()
                     .map_err(|e| format!("Failed to start audio client: {}", e))?;
@@ -122,7 +122,7 @@ mod windows_audio {
         pub fn stop(&self) -> Result<(), String> {
             unsafe {
                 let ptr = self.audio_client.load(AtomicOrdering::SeqCst);
-                let audio_client = IAudioClient::from_raw(ptr);
+                let audio_client: IAudioClient = Interface::from_raw(ptr as *mut _);
                 let result = audio_client
                     .Stop()
                     .map_err(|e| format!("Failed to stop audio client: {}", e));
@@ -134,7 +134,7 @@ mod windows_audio {
         pub fn read_buffer(&self) -> Result<Vec<f32>, String> {
             unsafe {
                 let ptr = self.capture_client.load(AtomicOrdering::SeqCst);
-                let capture_client = IAudioCaptureClient::from_raw(ptr);
+                let capture_client: IAudioCaptureClient = Interface::from_raw(ptr as *mut _);
                 
                 let mut buffer = Vec::new();
                 let mut frames_available = true;
@@ -192,10 +192,10 @@ mod windows_audio {
                 let capture_ptr = self.capture_client.load(AtomicOrdering::SeqCst);
                 
                 if !audio_ptr.is_null() {
-                    let _ = IAudioClient::from_raw(audio_ptr);
+                    let _audio: IAudioClient = Interface::from_raw(audio_ptr as *mut _);
                 }
                 if !capture_ptr.is_null() {
-                    let _ = IAudioCaptureClient::from_raw(capture_ptr);
+                    let _capture: IAudioCaptureClient = Interface::from_raw(capture_ptr as *mut _);
                 }
                 CoUninitialize();
             }
