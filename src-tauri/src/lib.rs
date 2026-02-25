@@ -18,7 +18,7 @@ lazy_static::lazy_static! {
 #[cfg(windows)]
 mod windows_audio {
     use std::ptr::null_mut;
-    use std::sync::atomic::{AtomicPtr, AtomicOrdering};
+    use std::sync::atomic::{AtomicPtr, Ordering};
     use windows::core::Interface;
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
@@ -108,7 +108,7 @@ mod windows_audio {
 
         pub fn start(&self) -> Result<(), String> {
             unsafe {
-                let ptr = self.audio_client.load(AtomicOrdering::SeqCst);
+                let ptr = self.audio_client.load(Ordering::SeqCst);
                 let audio_client: IAudioClient = Interface::from_raw(ptr as *mut _);
                 audio_client
                     .Start()
@@ -121,7 +121,7 @@ mod windows_audio {
 
         pub fn stop(&self) -> Result<(), String> {
             unsafe {
-                let ptr = self.audio_client.load(AtomicOrdering::SeqCst);
+                let ptr = self.audio_client.load(Ordering::SeqCst);
                 let audio_client: IAudioClient = Interface::from_raw(ptr as *mut _);
                 let result = audio_client
                     .Stop()
@@ -133,7 +133,7 @@ mod windows_audio {
 
         pub fn read_buffer(&self) -> Result<Vec<f32>, String> {
             unsafe {
-                let ptr = self.capture_client.load(AtomicOrdering::SeqCst);
+                let ptr = self.capture_client.load(Ordering::SeqCst);
                 let capture_client: IAudioCaptureClient = Interface::from_raw(ptr as *mut _);
                 
                 let mut buffer = Vec::new();
@@ -188,8 +188,8 @@ mod windows_audio {
         fn drop(&mut self) {
             unsafe {
                 // Properly release COM objects
-                let audio_ptr = self.audio_client.load(AtomicOrdering::SeqCst);
-                let capture_ptr = self.capture_client.load(AtomicOrdering::SeqCst);
+                let audio_ptr = self.audio_client.load(Ordering::SeqCst);
+                let capture_ptr = self.capture_client.load(Ordering::SeqCst);
                 
                 if !audio_ptr.is_null() {
                     let _audio: IAudioClient = Interface::from_raw(audio_ptr as *mut _);
