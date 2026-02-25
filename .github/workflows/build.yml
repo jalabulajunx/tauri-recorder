@@ -21,6 +21,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       
+      - name: Install vcpkg
+        uses: lukka/run-vcpkg@v7
+        with:
+          vcpkgDirectory: ${{ runner.workspace }}/vcpkg
+          vcpkgArguments: install opus
+      
+      - name: Set VCPKG_ROOT
+        run: echo "VCPKG_ROOT=${{ runner.workspace }}/vcpkg" >> $env:GITHUB_ENV
+      
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -37,10 +46,14 @@ jobs:
       
       - name: Build release (MSI)
         run: npm run tauri build -- --bundles msi
-      
+        env:
+          VCPKG_ROOT: ${{ runner.workspace }}/vcpkg
+
       - name: Build release (NSIS)
         run: npm run tauri build -- --bundles nsis
-      
+        env:
+          VCPKG_ROOT: ${{ runner.workspace }}/vcpkg
+
       - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
         with:
