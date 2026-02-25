@@ -1,8 +1,6 @@
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::Manager;
 
 // Global recording state
 static RECORDING: AtomicBool = AtomicBool::new(false);
@@ -18,7 +16,6 @@ lazy_static::lazy_static! {
 
 #[cfg(windows)]
 mod windows_audio {
-    use super::*;
     use std::ptr::null_mut;
     use windows::Win32::Foundation::*;
     use windows::Win32::Media::Audio::*;
@@ -149,8 +146,8 @@ mod windows_audio {
 
                     for i in 0..total_samples {
                         let sample = *samples.add(i);
-                        // Check for silence flag
-                        if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 != 0 {
+                        // Check for silence flag (AUDCLNT_BUFFERFLAGS_SILENT = 0x1)
+                        if flags & 0x1 != 0 {
                             buffer.push(0.0);
                         } else {
                             buffer.push(sample);
@@ -230,6 +227,7 @@ async fn start_recording(app: tauri::AppHandle) -> Result<String, String> {
             let _ = capture.stop();
 
             // Emit recording stopped event
+            use tauri::Manager;
             let _ = app_handle.emit("recording-stopped", ());
         });
 
@@ -241,6 +239,7 @@ async fn start_recording(app: tauri::AppHandle) -> Result<String, String> {
 
     #[cfg(not(windows))]
     {
+        let _ = app;
         Err("This application only works on Windows".to_string())
     }
 }
@@ -257,10 +256,13 @@ async fn stop_recording() -> Result<String, String> {
     // Wait a bit for the recording thread to finish
     std::thread::sleep(Duration::from_millis(100));
 
-    let duration = RECORDING_START
-        .lock()
-        .map(|start| start.map(|s| s.elapsed().as_secs()).unwrap_or(0))
-        .unwrap_or(0);
+    let duration = {
+        let guard = RECORDING_START.lock();
+        match *guard {
+            Some(start) => start.elapsed().as_secs(),
+            None => 0,
+        }
+    };
 
     Ok(format!("Recording stopped. Duration: {} seconds", duration))
 }
@@ -294,10 +296,11 @@ fn get_recording_status() -> serde_json::Value {
     let is_paused = PAUSED.load(Ordering::SeqCst);
     let buffer_size = AUDIO_BUFFER.lock().len();
     let duration = if is_recording {
-        RECORDING_START
-            .lock()
-            .map(|start| start.map(|s| s.elapsed().as_secs()).unwrap_or(0))
-            .unwrap_or(0)
+        let guard = RECORDING_START.lock();
+        match *guard {
+            Some(start) => start.elapsed().as_secs(),
+            None => 0,
+        }
     } else {
         0
     };
