@@ -18,22 +18,28 @@ lazy_static::lazy_static! {
 #[cfg(windows)]
 mod windows_audio {
     use std::ptr::null_mut;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicPtr, Ordering as AtomicOrdering};
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
 
-    pub struct WasapiLoopbackCapture {
-        device: IMMDevice,
-        audio_client: IAudioClient,
-        capture_client: IAudioCaptureClient,
+    // Thread-safe capture using raw pointers
+    pub struct ThreadSafeCapture {
+        audio_client: AtomicPtr<std::ffi::c_void>,
+        capture_client: AtomicPtr<std::ffi::c_void>,
         sample_rate: u32,
         channels: u16,
     }
 
-    impl WasapiLoopbackCapture {
+    // Safety: We only access these pointers from one thread at a time
+    unsafe impl Send for ThreadSafeCapture {}
+    unsafe impl Sync for ThreadSafeCapture {}
+
+    impl ThreadSafeCapture {
         pub fn new() -> Result<Self, String> {
             unsafe {
                 // Initialize COM
-                CoInitializeEx(None, COINIT_MULTITHREADED)
+                CoInitializeEx(None, COINIT_MULTITHREADED).ok()
                     .map_err(|e| format!("COM initialization failed: {}", e))?;
 
                 // Get default audio endpoint (render device for loopback)
@@ -60,9 +66,8 @@ mod windows_audio {
                 let channels = format.nChannels;
 
                 // Initialize audio client for loopback capture
-                // Using AUDCLNT_STREAMFLAGS_LOOPBACK to capture system audio
                 let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
-                let duration = 10_000_000; // 1 second in 100-nanosecond units
+                let duration = 10_000_000;
 
                 audio_client
                     .Initialize(
@@ -70,7 +75,7 @@ mod windows_audio {
                         stream_flags,
                         duration,
                         0,
-                        format_ptr,
+                        Some(format_ptr),
                         None,
                     )
                     .map_err(|e| format!("Failed to initialize audio client: {}", e))?;
@@ -80,13 +85,17 @@ mod windows_audio {
                     .GetService::<IAudioCaptureClient>()
                     .map_err(|e| format!("Failed to get capture client: {}", e))?;
 
-                // Free format memory
-                CoTaskMemFree(Some(format_ptr.as_ptr() as *const _));
+                // Store raw pointers
+                let audio_client_ptr = audio_client.as_raw();
+                let capture_client_ptr = capture_client.as_raw();
+
+                // Don't drop the COM objects - we'll manage them manually
+                std::mem::forget(audio_client);
+                std::mem::forget(capture_client);
 
                 Ok(Self {
-                    device,
-                    audio_client,
-                    capture_client,
+                    audio_client: AtomicPtr::new(audio_client_ptr),
+                    capture_client: AtomicPtr::new(capture_client_ptr),
                     sample_rate,
                     channels,
                 })
@@ -99,30 +108,42 @@ mod windows_audio {
 
         pub fn start(&self) -> Result<(), String> {
             unsafe {
-                self.audio_client
+                let ptr = self.audio_client.load(AtomicOrdering::SeqCst);
+                let audio_client = IAudioClient::from_raw(ptr);
+                audio_client
                     .Start()
-                    .map_err(|e| format!("Failed to start audio client: {}", e))
+                    .map_err(|e| format!("Failed to start audio client: {}", e))?;
+                // Don't decrement ref count
+                std::mem::forget(audio_client);
+                Ok(())
             }
         }
 
         pub fn stop(&self) -> Result<(), String> {
             unsafe {
-                self.audio_client
+                let ptr = self.audio_client.load(AtomicOrdering::SeqCst);
+                let audio_client = IAudioClient::from_raw(ptr);
+                let result = audio_client
                     .Stop()
-                    .map_err(|e| format!("Failed to stop audio client: {}", e))
+                    .map_err(|e| format!("Failed to stop audio client: {}", e));
+                std::mem::forget(audio_client);
+                result
             }
         }
 
         pub fn read_buffer(&self) -> Result<Vec<f32>, String> {
             unsafe {
+                let ptr = self.capture_client.load(AtomicOrdering::SeqCst);
+                let capture_client = IAudioCaptureClient::from_raw(ptr);
+                
                 let mut buffer = Vec::new();
                 let mut frames_available = true;
 
                 while frames_available {
-                    let mut packet_length = 0u32;
-                    let hr = self.capture_client.GetNextPacketSize(&mut packet_length);
+                    let packet_length = capture_client.GetNextPacketSize()
+                        .map_err(|e| format!("Failed to get packet size: {}", e))?;
 
-                    if hr.is_err() || packet_length == 0 {
+                    if packet_length == 0 {
                         frames_available = false;
                         continue;
                     }
@@ -131,7 +152,7 @@ mod windows_audio {
                     let mut num_frames = 0u32;
                     let mut flags = 0u32;
 
-                    self.capture_client
+                    capture_client
                         .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)
                         .map_err(|e| format!("Failed to get buffer: {}", e))?;
 
@@ -140,13 +161,11 @@ mod windows_audio {
                         continue;
                     }
 
-                    // Convert to f32 samples
                     let samples = data_ptr as *const f32;
                     let total_samples = (num_frames * self.channels as u32) as usize;
 
                     for i in 0..total_samples {
                         let sample = *samples.add(i);
-                        // Check for silence flag (AUDCLNT_BUFFERFLAGS_SILENT = 0x1)
                         if flags & 0x1 != 0 {
                             buffer.push(0.0);
                         } else {
@@ -154,20 +173,30 @@ mod windows_audio {
                         }
                     }
 
-                    self.capture_client
+                    capture_client
                         .ReleaseBuffer(num_frames)
                         .map_err(|e| format!("Failed to release buffer: {}", e))?;
                 }
 
+                std::mem::forget(capture_client);
                 Ok(buffer)
             }
         }
     }
 
-    impl Drop for WasapiLoopbackCapture {
+    impl Drop for ThreadSafeCapture {
         fn drop(&mut self) {
             unsafe {
-                let _ = self.audio_client.Stop();
+                // Properly release COM objects
+                let audio_ptr = self.audio_client.load(AtomicOrdering::SeqCst);
+                let capture_ptr = self.capture_client.load(AtomicOrdering::SeqCst);
+                
+                if !audio_ptr.is_null() {
+                    let _ = IAudioClient::from_raw(audio_ptr);
+                }
+                if !capture_ptr.is_null() {
+                    let _ = IAudioCaptureClient::from_raw(capture_ptr);
+                }
                 CoUninitialize();
             }
         }
@@ -175,7 +204,7 @@ mod windows_audio {
 }
 
 #[cfg(windows)]
-use windows_audio::WasapiLoopbackCapture;
+use windows_audio::ThreadSafeCapture;
 
 /// Start recording system audio (loopback capture)
 #[tauri::command]
@@ -191,7 +220,7 @@ async fn start_recording(app: tauri::AppHandle) -> Result<String, String> {
         *RECORDING_START.lock() = Some(Instant::now());
 
         // Initialize WASAPI loopback capture
-        let capture = WasapiLoopbackCapture::new()?;
+        let capture = ThreadSafeCapture::new()?;
         let (sample_rate, channels) = capture.get_format();
         *SAMPLE_RATE.lock() = sample_rate;
         *CHANNELS.lock() = channels;
