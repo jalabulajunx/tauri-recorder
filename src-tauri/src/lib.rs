@@ -396,25 +396,30 @@ fn save_as_wav(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> R
 }
 
 fn save_as_ogg(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> Result<(), String> {
-    use libopusenc::{Encoder, Channels, Application};
-    use std::fs::File;
-    use std::io::BufWriter;
+    use libopusenc::{OpusEncoder, OpusEncComments, OpusEncSampleRate, OpusEncChannelMapping};
     
-    // Create output file
-    let file = File::create(path)
-        .map_err(|e| format!("Failed to create file: {}", e))?;
+    // Create comments (empty for now)
+    let mut comments = OpusEncComments::new()
+        .map_err(|e| format!("Failed to create comments: {:?}", e))?;
     
-    // Create Opus encoder
-    let mut encoder = Encoder::new(
-        BufWriter::new(file),
-        sample_rate as i32,
-        if channels == 2 { Channels::Stereo } else { Channels::Mono },
-        Application::Audio,
-    ).map_err(|e| format!("Failed to create encoder: {}", e))?;
+    // Map sample rate to enum
+    let rate = match sample_rate {
+        48000 => OpusEncSampleRate::Rate48000,
+        24000 => OpusEncSampleRate::Rate24000,
+        16000 => OpusEncSampleRate::Rate16000,
+        12000 => OpusEncSampleRate::Rate12000,
+        8000 => OpusEncSampleRate::Rate8000,
+        _ => OpusEncSampleRate::Rate48000, // Default to 48kHz
+    };
     
-    // Set bitrate (96kbps for good quality)
-    encoder.set_bitrate(96000)
-        .map_err(|e| format!("Failed to set bitrate: {}", e))?;
+    // Create encoder
+    let mut encoder = OpusEncoder::create_file(
+        path,
+        &mut comments,
+        rate,
+        channels as u8,
+        OpusEncChannelMapping::Voice,
+    ).map_err(|e| format!("Failed to create encoder: {:?}", e))?;
     
     // Convert f32 to i16
     let mut pcm_data: Vec<i16> = Vec::with_capacity(buffer.len());
@@ -425,11 +430,11 @@ fn save_as_ogg(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> R
     
     // Encode the entire buffer
     encoder.encode(&pcm_data)
-        .map_err(|e| format!("Failed to encode: {}", e))?;
+        .map_err(|e| format!("Failed to encode: {:?}", e))?;
     
     // Finish
     encoder.finalize()
-        .map_err(|e| format!("Failed to finalize: {}", e))?;
+        .map_err(|e| format!("Failed to finalize: {:?}", e))?;
     
     Ok(())
 }
