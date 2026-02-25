@@ -26,7 +26,7 @@ lazy_static = "1.4"
 cpal = "0.15"
 hound = "3.5"
 # Use libopusenc for simple Ogg Opus encoding
-libopusenc = "0.3"
+libopusenc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
