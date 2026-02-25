@@ -396,29 +396,30 @@ fn save_as_wav(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> R
 }
 
 fn save_as_ogg(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> Result<(), String> {
-    use opus::{Channels, Encoder, Application};
-    use ogg::OggWrite;
-    use ogg::pages::OggPage;
-    use ogg::packet::OggPacket;
+    use opus::{Channels, Encoder, Application, Bitrate};
+    use ogg::OggStream;
+    use std::io::BufWriter;
+    use std::fs::File;
     
-    // Opus expects 48kHz, but we can work with other rates
+    // Opus encoder arguments: sample_rate, channels, application
     let encoder = Encoder::new(
-        Application::Audio,
+        sample_rate as u32,
         if channels == 2 { Channels::Stereo } else { Channels::Mono },
-        sample_rate as i32,
+        Application::Audio,
     ).map_err(|e| format!("Failed to create Opus encoder: {:?}", e))?;
     
-    // Set bitrate (128kbps is good quality)
-    encoder.set_bitrate(128000)
+    // Set bitrate
+    encoder.set_bitrate(Bitrate::Bits(128000))
         .map_err(|e| format!("Failed to set bitrate: {:?}", e))?;
     
-    // Create OGG writer
-    let file = std::fs::File::create(path)
+    // Create OGG file
+    let file = File::create(path)
         .map_err(|e| format!("Failed to create file: {}", e))?;
-    let mut ogg_writer = OggWrite::new(file)
-        .map_err(|e| format!("Failed to create OGG writer: {:?}", e))?;
+    let writer = BufWriter::new(file);
+    let mut ogg_stream = OggStream::write(writer)
+        .map_err(|e| format!("Failed to create OGG stream: {:?}", e))?;
     
-    // Convert f32 to i16 (Opus expects 16-bit PCM)
+    // Convert f32 to i16
     let pcm_size = buffer.len();
     let mut pcm_data: Vec<i16> = Vec::with_capacity(pcm_size);
     for &sample in buffer {
@@ -426,9 +427,10 @@ fn save_as_ogg(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> R
         pcm_data.push(s);
     }
     
-    // Encode in frames (Opus uses 20ms frames at 48kHz = 960 samples per channel)
+    // Encode in frames (Opus uses 20ms frames)
     let frame_size = 960;
     let mut offset = 0;
+    let mut serial = 12345u32; // Random serial number
     
     while offset + frame_size <= pcm_data.len() {
         let frame: Vec<i16> = pcm_data[offset..offset + frame_size].to_vec();
@@ -439,16 +441,19 @@ fn save_as_ogg(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> R
         
         if len > 0 {
             output.truncate(len);
-            let packet = OggPacket::new(output, 0, true);
-            ogg_writer.write_packet(packet)
-                .map_err(|e| format!("Failed to write OGG packet: {:?}", e))?;
+            
+            let packet = ogg::Packet::new(output, 1, false);
+            let page = ogg::Page::new(packet);
+            ogg_stream.write_page(&page)
+                .map_err(|e| format!("Failed to write OGG page: {:?}", e))?;
         }
         
         offset += frame_size;
     }
     
-    ogg_writer.finish()
-        .map_err(|e| format!("Failed to finish OGG file: {:?}", e))?;
+    // Flush
+    ogg_stream.flush()
+        .map_err(|e| format!("Failed to flush OGG stream: {:?}", e))?;
     
     Ok(())
 }
