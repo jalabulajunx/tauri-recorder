@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teams Audio Recorder</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🎙️ Teams Audio Recorder</h1>
+      <p class="subtitle">Educational PoC - WASAPI Loopback Capture</p>
+    </header>
+
+    <main>
+      <div class="status-panel">
+        <div class="status-indicator" id="statusIndicator">
+          <span class="status-dot"></span>
+          <span id="statusText">Ready</span>
+        </div>
+        <div class="time-display" id="timeDisplay">00:00:00</div>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn" class="btn btn-primary">
+          <span class="icon">⏺</span>
+          Start Recording
+        </button>
+        <button id="pauseBtn" class="btn btn-secondary" disabled>
+          <span class="icon">⏸</span>
+          Pause
+        </button>
+        <button id="stopBtn" class="btn btn-danger" disabled>
+          <span class="icon">⏹</span>
+          Stop
+        </button>
+      </div>
+
+      <div class="save-section">
+        <button id="saveBtn" class="btn btn-success" disabled>
+          <span class="icon">💾</span>
+          Save Recording
+        </button>
+        <button id="clearBtn" class="btn btn-warning" disabled>
+          <span class="icon">🗑️</span>
+          Clear
+        </button>
+      </div>
+
+      <div class="info-panel">
+        <h3>Recording Info</h3>
+        <div class="info-grid">
+          <div class="info-item">
+            <span class="label">Sample Rate:</span>
+            <span id="sampleRate">--</span>
+          </div>
+          <div class="info-item">
+            <span class="label">Channels:</span>
+            <span id="channels">--</span>
+          </div>
+          <div class="info-item">
+            <span class="label">Buffer Size:</span>
+            <span id="bufferSize">--</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="message-box" id="messageBox"></div>
+    </main>
+
+    <footer>
+      <p>⚠️ For educational purposes only. Requires Windows.</p>
+    </footer>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>
