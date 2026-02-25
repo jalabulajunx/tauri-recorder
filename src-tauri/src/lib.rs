@@ -343,7 +343,7 @@ fn get_recording_status() -> serde_json::Value {
     })
 }
 
-/// Save recorded audio to WAV file
+/// Save recorded audio to WAV or OGG file
 #[tauri::command]
 async fn save_recording(path: String) -> Result<String, String> {
     let buffer = AUDIO_BUFFER.lock().clone();
@@ -354,18 +354,34 @@ async fn save_recording(path: String) -> Result<String, String> {
         return Err("No audio data to save".to_string());
     }
 
-    // Create WAV file
+    let path_lower = path.to_lowercase();
+    
+    if path_lower.ends_with(".ogg") || path_lower.ends_with(".opus") {
+        // Save as OGG/Opus
+        save_as_ogg(&path, &buffer, sample_rate, channels)?;
+    } else {
+        // Save as WAV (default)
+        save_as_wav(&path, &buffer, sample_rate, channels)?;
+    }
+
+    let duration_secs = buffer.len() as f32 / (sample_rate as f32 * channels as f32);
+    Ok(format!(
+        "Saved {} seconds of audio to {}",
+        duration_secs, path
+    ))
+}
+
+fn save_as_wav(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> Result<(), String> {
     let spec = hound::WavSpec {
-        channels: channels,
-        sample_rate: sample_rate,
+        channels,
+        sample_rate,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
 
-    let mut writer = hound::WavWriter::create(&path, spec)
+    let mut writer = hound::WavWriter::create(path, spec)
         .map_err(|e| format!("Failed to create WAV file: {}", e))?;
 
-    // Write samples
     for sample in buffer.iter() {
         writer
             .write_sample(*sample)
@@ -376,11 +392,65 @@ async fn save_recording(path: String) -> Result<String, String> {
         .finalize()
         .map_err(|e| format!("Failed to finalize WAV file: {}", e))?;
 
-    let duration_secs = buffer.len() as f32 / (sample_rate as f32 * channels as f32);
-    Ok(format!(
-        "Saved {} seconds of audio to {}",
-        duration_secs, path
-    ))
+    Ok(())
+}
+
+fn save_as_ogg(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> Result<(), String> {
+    use opus::{Channels, Encoder, Application};
+    use ogg::OggWrite;
+    use ogg::pages::OggPage;
+    use ogg::packet::OggPacket;
+    
+    // Opus expects 48kHz, but we can work with other rates
+    let encoder = Encoder::new(
+        Application::Audio,
+        if channels == 2 { Channels::Stereo } else { Channels::Mono },
+        sample_rate as i32,
+    ).map_err(|e| format!("Failed to create Opus encoder: {:?}", e))?;
+    
+    // Set bitrate (128kbps is good quality)
+    encoder.set_bitrate(128000)
+        .map_err(|e| format!("Failed to set bitrate: {:?}", e))?;
+    
+    // Create OGG writer
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+    let mut ogg_writer = OggWrite::new(file)
+        .map_err(|e| format!("Failed to create OGG writer: {:?}", e))?;
+    
+    // Convert f32 to i16 (Opus expects 16-bit PCM)
+    let pcm_size = buffer.len();
+    let mut pcm_data: Vec<i16> = Vec::with_capacity(pcm_size);
+    for &sample in buffer {
+        let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        pcm_data.push(s);
+    }
+    
+    // Encode in frames (Opus uses 20ms frames at 48kHz = 960 samples per channel)
+    let frame_size = 960;
+    let mut offset = 0;
+    
+    while offset + frame_size <= pcm_data.len() {
+        let frame: Vec<i16> = pcm_data[offset..offset + frame_size].to_vec();
+        
+        let mut output = vec![0u8; 4000];
+        let len = encoder.encode(&frame, &mut output)
+            .map_err(|e| format!("Failed to encode: {:?}", e))?;
+        
+        if len > 0 {
+            output.truncate(len);
+            let packet = OggPacket::new(output, 0, true);
+            ogg_writer.write_packet(packet)
+                .map_err(|e| format!("Failed to write OGG packet: {:?}", e))?;
+        }
+        
+        offset += frame_size;
+    }
+    
+    ogg_writer.finish()
+        .map_err(|e| format!("Failed to finish OGG file: {:?}", e))?;
+    
+    Ok(())
 }
 
 /// Clear recorded audio buffer

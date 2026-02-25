@@ -132,11 +132,11 @@ async function togglePause() {
 async function saveRecording() {
   try {
     const filePath = await save({
-      defaultPath: `recording_${new Date().toISOString().replace(/[:.]/g, '-')}.wav`,
-      filters: [{
-        name: 'WAV Audio',
-        extensions: ['wav']
-      }]
+      defaultPath: `recording_${new Date().toISOString().replace(/[:.]/g, '-')}.ogg`,
+      filters: [
+        { name: 'OGG Audio', extensions: ['ogg'] },
+        { name: 'WAV Audio', extensions: ['wav'] }
+      ]
     });
 
     if (filePath) {
