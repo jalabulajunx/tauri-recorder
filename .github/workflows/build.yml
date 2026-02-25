@@ -21,10 +21,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       
-      - name: Install vcpkg
+      - name: Setup vcpkg
         uses: lukka/run-vcpkg@v7
         with:
           vcpkgDirectory: ${{ runner.workspace }}/vcpkg
+          vcpkgGitCommitId: 3b24392044918f5e3c9be3d7d6f72c2b88e9c7b9
           vcpkgArguments: install opus
       
       - name: Set VCPKG_ROOT
