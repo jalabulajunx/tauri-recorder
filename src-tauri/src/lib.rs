@@ -396,29 +396,15 @@ fn save_as_wav(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> R
 }
 
 fn save_as_ogg(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> Result<(), String> {
-    use libopusenc::{OpusEncoder, OpusEncComments, OpusEncSampleRate, OpusEncChannelMapping};
+    use opusenc::{Encoder, Comments, MappingFamily, RecommendedTag};
     
-    // Create comments (empty for now)
-    let mut comments = OpusEncComments::new()
-        .map_err(|e| format!("Failed to create comments: {:?}", e))?;
-    
-    // Map sample rate to enum
-    let rate = match sample_rate {
-        48000 => OpusEncSampleRate::Rate48000,
-        24000 => OpusEncSampleRate::Rate24000,
-        16000 => OpusEncSampleRate::Rate16000,
-        12000 => OpusEncSampleRate::Rate12000,
-        8000 => OpusEncSampleRate::Rate8000,
-        _ => OpusEncSampleRate::Rate48000, // Default to 48kHz
-    };
-    
-    // Create encoder
-    let mut encoder = OpusEncoder::create_file(
+    // Create encoder - opusenc uses simpler API
+    let mut encoder = Encoder::create_file(
         path,
-        &mut comments,
-        rate,
-        channels as u8,
-        OpusEncChannelMapping::Voice,
+        Comments::create(),
+        sample_rate as i32,
+        channels as i32,
+        MappingFamily::Auto,
     ).map_err(|e| format!("Failed to create encoder: {:?}", e))?;
     
     // Convert f32 to i16
