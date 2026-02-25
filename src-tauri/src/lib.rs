@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tauri::Emitter;
 
 // Global recording state
 static RECORDING: AtomicBool = AtomicBool::new(false);
@@ -17,7 +18,6 @@ lazy_static::lazy_static! {
 #[cfg(windows)]
 mod windows_audio {
     use std::ptr::null_mut;
-    use windows::Win32::Foundation::*;
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
 
@@ -33,7 +33,7 @@ mod windows_audio {
         pub fn new() -> Result<Self, String> {
             unsafe {
                 // Initialize COM
-                CoInitializeEx(null_mut(), COINIT_MULTITHREADED)
+                CoInitializeEx(None, COINIT_MULTITHREADED)
                     .map_err(|e| format!("COM initialization failed: {}", e))?;
 
                 // Get default audio endpoint (render device for loopback)
@@ -227,7 +227,6 @@ async fn start_recording(app: tauri::AppHandle) -> Result<String, String> {
             let _ = capture.stop();
 
             // Emit recording stopped event
-            use tauri::Manager;
             let _ = app_handle.emit("recording-stopped", ());
         });
 
