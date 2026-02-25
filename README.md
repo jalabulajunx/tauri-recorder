@@ -8,7 +8,8 @@ A Tauri 2.0-based Windows application that captures system audio (including Team
 
 - **WASAPI Loopback Capture**: Captures system audio output (what you hear through speakers/headphones)
 - **Audio Recording**: Records all system audio including Teams, browser, and other applications
-- **WAV Export**: Saves recordings in high-quality WAV format (32-bit float)
+- **Ogg/Opus Export**: Saves recordings in compressed Ogg/Opus format (~30 MB/hr vs ~660 MB/hr for WAV)
+- **WAV Export**: Optionally save as uncompressed WAV (32-bit float)
 - **Pause/Resume**: Ability to pause and resume recordings
 - **Real-time Status**: Shows recording duration, sample rate, and buffer size
 
@@ -171,97 +172,85 @@ jobs:
           path: src-tauri/target/release/bundle/msi/*.msi
 ```
 
-## Cross-Compilation from Linux
+## Cross-Compilation from Linux (mingw-w64)
 
-You can build Windows binaries from Linux using cross-compilation. This is useful if you don't have access to a Windows machine.
+You can build Windows binaries entirely from Linux — no GitHub Actions required.
 
-### Option 1: Using Cross (Recommended)
+### Why This Works Now
 
-[Cross](https://github.com/cross-rs/cross) is a tool for cross-compiling Rust applications using Docker containers.
+The previous `opusenc` crate required three pre-installed C system libraries
+(`libopusenc`, `libopus`, `libogg`) which were a nightmare to cross-compile.
+
+The current approach eliminates that:
+
+| Dependency | How it builds | Cross-compilation story |
+|---|---|---|
+| **audiopus** (libopus) | `audiopus_sys` compiles opus 1.3 from vendored C source via autotools | Picks up `x86_64-w64-mingw32-gcc` automatically |
+| **ogg** | Pure Rust — no C at all | Just works™ |
+| **windows** crate | Pure Rust FFI definitions | Just works™ |
+
+### Prerequisites (Linux — Arch/Manjaro)
 
 ```bash
-# Install cross
-cargo install cross
-
-# Install Docker (if not already installed)
-# Ubuntu/Debian:
-sudo apt-get update && sudo apt-get install docker.io
-sudo usermod -aG docker $USER
-# Log out and back in for group changes to take effect
-
-# Add Windows target
+# Rust cross-compilation target
 rustup target add x86_64-pc-windows-gnu
 
-# Build for Windows
-cross build --target x86_64-pc-windows-gnu --release
+# mingw-w64 toolchain
+sudo pacman -S mingw-w64-gcc
+
+# Build tools that audiopus_sys needs to compile libopus from source
+sudo pacman -S base-devel autoconf automake libtool cmake
 ```
 
-**Limitations**:
-- Produces a `.exe` file but **cannot create MSI/NSIS installers**
-- The Windows API bindings (`windows-rs` crate) may have issues with cross-compilation
-- WebView2 runtime must be present on the target machine
-
-### Option 2: Using Cargo Directly with MinGW
+<details><summary>Ubuntu/Debian prerequisites</summary>
 
 ```bash
-# Install MinGW-w64 cross-compiler
-sudo apt-get install mingw-w64
-
-# Add Windows target
 rustup target add x86_64-pc-windows-gnu
+sudo apt install mingw-w64 build-essential autoconf automake libtool cmake pkg-config
+```
 
-# Configure cargo for cross-compilation
-mkdir -p ~/.cargo
-cat >> ~/.cargo/config.toml << 'EOF'
+</details>
+
+### Configure Cargo for cross-compilation
+
+```bash
+mkdir -p .cargo
+cat > .cargo/config.toml << 'EOF'
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-gcc-ar"
 EOF
-
-# Build
-cargo build --target x86_64-pc-windows-gnu --release
 ```
 
-### Option 3: Using GitHub Actions (Best for Production)
-
-The most reliable way to build Windows binaries from Linux is to use GitHub Actions with a Windows runner. This is already configured in [`.github/workflows/build.yml`](.github/workflows/build.yml).
+### Build
 
 ```bash
-# Push a tag to trigger the build
-git tag v0.1.0
-git push origin v0.1.0
+# Static-link libopus into the binary (recommended for distribution)
+LIBOPUS_STATIC=1 cargo build \
+    --manifest-path src-tauri/Cargo.toml \
+    --target x86_64-pc-windows-gnu \
+    --release
 ```
 
-The workflow will:
-1. Run on a Windows machine in the cloud
-2. Build MSI, NSIS, and portable executables
-3. Create a GitHub Release with all artifacts
+The `.exe` lands at `src-tauri/target/x86_64-pc-windows-gnu/release/tauri-recorder.exe`.
 
-### Cross-Compilation Caveats for This Project
+### Full Tauri build (with bundler — MSI/NSIS)
 
-This project uses the `windows` crate for WASAPI audio capture. Cross-compilation has specific challenges:
+For MSI/NSIS installers you still need the Tauri CLI and a WiX/NSIS toolchain.
+The simplest path for installer builds is running on Windows natively or in a VM.
+For just the `.exe` + WebView2, the mingw cross-build above is sufficient.
 
-1. **COM/Windows API**: The `windows-rs` crate is designed for native Windows compilation. Cross-compilation may fail due to Windows-specific API bindings.
+### GitHub Actions (optional, for production)
 
-2. **Recommended Approach**: Use GitHub Actions (Option 3) for building Windows binaries. It's free for public repositories and provides a genuine Windows environment.
-
-3. **Alternative**: Use a Windows VM (VirtualBox, VMware) or Windows dual-boot setup.
-
-### Quick Test with GitHub Actions
-
-If you have this project on GitHub, you can manually trigger the build:
-
-1. Go to **Actions** tab in your repository
-2. Select **Build Release** workflow
-3. Click **Run workflow**
-4. Download the artifacts when complete
+GitHub Actions with `windows-latest` runner remains the easiest way to get
+full MSI/NSIS installers. See [`.github/workflows/build.yml`](.github/workflows/build.yml).
 
 ## Usage
 
 1. **Start Recording**: Click the "Start Recording" button to begin capturing system audio
 2. **Pause/Resume**: Use the pause button to temporarily stop recording
 3. **Stop Recording**: Click "Stop" to end the recording session
-4. **Save Recording**: Click "Save Recording" to export as WAV file
+4. **Save Recording**: Click "Save Recording" to export as Ogg/Opus (default) or WAV
 5. **Clear**: Discard the current recording buffer
 
 ## How It Works
@@ -275,13 +264,26 @@ The application uses Windows Audio Session API (WASAPI) with loopback mode to ca
 3. **Loopback Stream**: Creates an audio stream with `AUDCLNT_STREAMFLAGS_LOOPBACK` flag
 4. **Capture Audio**: Reads audio buffers from the capture client
 5. **Store Samples**: Accumulates audio samples in a thread-safe buffer
-6. **Export WAV**: Writes samples to a WAV file using the hound library
+6. **Encode Ogg/Opus**: Encodes the buffer into Ogg/Opus using `audiopus` + `ogg`
+
+### Ogg/Opus Encoding Pipeline
+
+The save process constructs an RFC 7845-compliant Ogg/Opus stream:
+
+1. **OpusHead** header — codec version, channels, pre-skip, original sample rate
+2. **OpusTags** header — vendor string, comment list
+3. **Audio packets** — 20 ms Opus frames wrapped in OGG pages with granule positions at 48 kHz
+
+If the WASAPI device outputs at a non-Opus rate (e.g. 44.1 kHz), a linear
+interpolation resampler converts to 48 kHz before encoding.
 
 ### Technical Details
 
 - **Sample Format**: 32-bit float (matches Windows audio engine)
-- **Sample Rate**: Matches system audio format (typically 48kHz)
+- **Sample Rate**: Matches system audio format (typically 48 kHz)
 - **Channels**: Matches system configuration (typically stereo)
+- **Opus Bitrate**: 64 kbps VBR (configurable in `lib.rs`)
+- **Frame Duration**: 20 ms (960 samples/channel at 48 kHz)
 - **Buffer Management**: Thread-safe with parking_lot Mutex
 
 ## Project Structure
@@ -306,11 +308,13 @@ tauri-recorder/
 ## Key Dependencies
 
 ### Rust (Cargo.toml)
-- `tauri` - Cross-platform desktop framework
-- `windows` - Windows API bindings (WASAPI)
-- `hound` - WAV file encoding
-- `parking_lot` - High-performance synchronization primitives
-- `tokio` - Async runtime
+- `tauri` — Cross-platform desktop framework
+- `windows` — Windows API bindings (WASAPI loopback capture)
+- `audiopus` — Safe Opus encoder (compiles libopus 1.3 from vendored C source)
+- `ogg` — Pure-Rust OGG container writer (no C dependency)
+- `hound` — WAV file encoding (fallback format)
+- `parking_lot` — High-performance synchronization primitives
+- `tokio` — Async runtime
 
 ### JavaScript
 - Tauri API for IPC communication

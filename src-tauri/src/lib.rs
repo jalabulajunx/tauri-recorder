@@ -396,33 +396,165 @@ fn save_as_wav(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> R
 }
 
 fn save_as_ogg(path: &str, buffer: &[f32], sample_rate: u32, channels: u16) -> Result<(), String> {
-    use opusenc::{Encoder, Comments, MappingFamily, RecommendedTag};
-    
-    // Create encoder - opusenc uses simpler API
-    let mut encoder = Encoder::create_file(
-        path,
-        Comments::create(),
-        sample_rate as i32,
-        channels as i32,
-        MappingFamily::Auto,
-    ).map_err(|e| format!("Failed to create encoder: {:?}", e))?;
-    
-    // Convert f32 to i16
-    let mut pcm_data: Vec<i16> = Vec::with_capacity(buffer.len());
-    for &sample in buffer {
-        let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        pcm_data.push(s);
+    use audiopus::coder::Encoder as OpusEncoder;
+    use audiopus::{Application, Channels as OpusChannels, SampleRate as OpusSampleRate, Bitrate};
+    use ogg::writing::{PacketWriter, PacketWriteEndInfo};
+    use std::fs::File;
+    use std::io::BufWriter;
+
+    // Opus supported sample rates: 8000, 12000, 16000, 24000, 48000
+    let opus_rate = match sample_rate {
+        8000  => OpusSampleRate::Hz8000,
+        12000 => OpusSampleRate::Hz12000,
+        16000 => OpusSampleRate::Hz16000,
+        24000 => OpusSampleRate::Hz24000,
+        48000 => OpusSampleRate::Hz48000,
+        _ => OpusSampleRate::Hz48000, // will resample below
+    };
+
+    let opus_channels = match channels {
+        1 => OpusChannels::Mono,
+        2 => OpusChannels::Stereo,
+        _ => return Err(format!("Unsupported channel count: {}. Opus supports mono/stereo.", channels)),
+    };
+
+    // Resample to an Opus-compatible rate if needed (e.g. 44100 → 48000)
+    let needs_resample = !matches!(sample_rate, 8000 | 12000 | 16000 | 24000 | 48000);
+    let (audio_data, encode_rate) = if needs_resample {
+        let resampled = resample_linear(buffer, sample_rate, 48000, channels);
+        (resampled, 48000u32)
+    } else {
+        (buffer.to_vec(), sample_rate)
+    };
+
+    // Create Opus encoder
+    let mut encoder = OpusEncoder::new(opus_rate, opus_channels, Application::Audio)
+        .map_err(|e| format!("Failed to create Opus encoder: {}", e))?;
+
+    // 64 kbps — good quality for meeting recordings, ~30 MB/hr stereo
+    encoder.set_bitrate(Bitrate::BitsPerSecond(64_000))
+        .map_err(|e| format!("Failed to set bitrate: {}", e))?;
+
+    // Get encoder lookahead (pre-skip) — how many samples the decoder must discard
+    let pre_skip = encoder.lookahead()
+        .map_err(|e| format!("Failed to get lookahead: {}", e))? as u16;
+
+    // OGG Opus always expresses granule position at 48 kHz
+    let pre_skip_48 = if encode_rate == 48000 {
+        pre_skip
+    } else {
+        ((pre_skip as u64) * 48000 / encode_rate as u64) as u16
+    };
+
+    // Open output file
+    let file = File::create(path)
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+    let writer = BufWriter::new(file);
+    let mut pkt_writer = PacketWriter::new(writer);
+
+    // Stream serial — use nanosecond component of system time
+    let serial: u32 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+
+    // ── OpusHead (RFC 7845 §5.1) ──────────────────────────────────────
+    let mut opus_head = Vec::with_capacity(19);
+    opus_head.extend_from_slice(b"OpusHead");                      // magic
+    opus_head.push(1);                                             // version
+    opus_head.push(channels as u8);                                // channel count
+    opus_head.extend_from_slice(&pre_skip_48.to_le_bytes());       // pre-skip (at 48 kHz)
+    opus_head.extend_from_slice(&sample_rate.to_le_bytes());       // original sample rate (informational)
+    opus_head.extend_from_slice(&0i16.to_le_bytes());              // output gain
+    opus_head.push(0);                                             // channel mapping family 0
+
+    pkt_writer.write_packet(opus_head, serial, PacketWriteEndInfo::EndPage, 0)
+        .map_err(|e| format!("Failed to write OpusHead: {}", e))?;
+
+    // ── OpusTags (RFC 7845 §5.2) ──────────────────────────────────────
+    let vendor = b"tauri-recorder";
+    let mut opus_tags = Vec::with_capacity(8 + 4 + vendor.len() + 4);
+    opus_tags.extend_from_slice(b"OpusTags");
+    opus_tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    opus_tags.extend_from_slice(vendor);
+    opus_tags.extend_from_slice(&0u32.to_le_bytes());              // 0 user comments
+
+    pkt_writer.write_packet(opus_tags, serial, PacketWriteEndInfo::EndPage, 0)
+        .map_err(|e| format!("Failed to write OpusTags: {}", e))?;
+
+    // ── Audio frames ───────────────────────────────────────────────────
+    // 20 ms frames — the sweet spot for quality vs. overhead
+    let frame_samples_per_ch = encode_rate as usize / 50;          // 960 @ 48 kHz
+    let frame_size = frame_samples_per_ch * channels as usize;     // interleaved total
+    let mut output_buf = vec![0u8; 4000];                          // max Opus packet
+    let mut granule_pos: u64 = pre_skip_48 as u64;
+
+    // Ratio for converting encode_rate granules to 48 kHz granules
+    let granule_samples_per_frame: u64 = if encode_rate == 48000 {
+        frame_samples_per_ch as u64
+    } else {
+        (frame_samples_per_ch as u64) * 48000 / encode_rate as u64
+    };
+
+    let total_chunks = if audio_data.is_empty() { 0 } else {
+        (audio_data.len() + frame_size - 1) / frame_size
+    };
+
+    for (i, chunk) in audio_data.chunks(frame_size).enumerate() {
+        let is_last = i + 1 == total_chunks;
+
+        // Pad final frame with silence so Opus gets a complete frame
+        let frame: Vec<f32> = if chunk.len() < frame_size {
+            let mut padded = chunk.to_vec();
+            padded.resize(frame_size, 0.0);
+            padded
+        } else {
+            chunk.to_vec()
+        };
+
+        let encoded_len = encoder.encode_float(&frame, &mut output_buf)
+            .map_err(|e| format!("Opus encode error on frame {}: {}", i, e))?;
+
+        granule_pos += granule_samples_per_frame;
+
+        let end_info = if is_last {
+            PacketWriteEndInfo::EndStream
+        } else {
+            PacketWriteEndInfo::NormalPacket
+        };
+
+        pkt_writer.write_packet(
+            output_buf[..encoded_len].to_vec(),
+            serial,
+            end_info,
+            granule_pos,
+        ).map_err(|e| format!("Failed to write audio packet {}: {}", i, e))?;
     }
-    
-    // Encode the entire buffer
-    encoder.encode(&pcm_data)
-        .map_err(|e| format!("Failed to encode: {:?}", e))?;
-    
-    // Finish
-    encoder.finalize()
-        .map_err(|e| format!("Failed to finalize: {:?}", e))?;
-    
+
     Ok(())
+}
+
+/// Linear-interpolation resampler (good enough for a PoC).
+/// Converts interleaved f32 PCM from `from_rate` to `to_rate`.
+fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32, channels: u16) -> Vec<f32> {
+    let ch = channels as usize;
+    let in_frames = input.len() / ch;
+    let out_frames = ((in_frames as u64) * (to_rate as u64) / (from_rate as u64)) as usize;
+    let mut output = Vec::with_capacity(out_frames * ch);
+
+    for i in 0..out_frames {
+        let src_pos = (i as f64) * (from_rate as f64) / (to_rate as f64);
+        let idx = src_pos as usize;
+        let frac = (src_pos - idx as f64) as f32;
+
+        for c in 0..ch {
+            let s0 = input.get(idx * ch + c).copied().unwrap_or(0.0);
+            let s1 = input.get((idx + 1) * ch + c).copied().unwrap_or(s0);
+            output.push(s0 + (s1 - s0) * frac);
+        }
+    }
+
+    output
 }
 
 /// Clear recorded audio buffer
