@@ -24,3 +24,6 @@ dist-ssr
 *.sw?
 teams-audio-recorder-msi.zip
 teams-audio-recorder-nsis.zip
+
+# Cross-compiled libopus for Windows (built by scripts/build-opus-win64.sh)
+opus-win64/

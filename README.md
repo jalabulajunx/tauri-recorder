@@ -176,18 +176,23 @@ jobs:
 
 You can build Windows binaries entirely from Linux — no GitHub Actions required.
 
-### Why This Works Now
+### Why not just `opusenc`?
 
 The previous `opusenc` crate required three pre-installed C system libraries
 (`libopusenc`, `libopus`, `libogg`) which were a nightmare to cross-compile.
 
-The current approach eliminates that:
+We replaced them with **two crates** that have a much simpler dependency story:
 
 | Dependency | How it builds | Cross-compilation story |
 |---|---|---|
-| **audiopus** (libopus) | `audiopus_sys` compiles opus 1.3 from vendored C source via autotools | Picks up `x86_64-w64-mingw32-gcc` automatically |
+| **audiopus** (libopus) | `audiopus_sys` compiles opus 1.3 from vendored C source | Need one manual step — see below |
 | **ogg** | Pure Rust — no C at all | Just works™ |
 | **windows** crate | Pure Rust FFI definitions | Just works™ |
+
+> **Caveat:** `audiopus_sys`'s build script calls autotools `configure` without
+> `--host`, so it uses the host compiler instead of the cross-compiler.
+> We work around this by pre-building `libopus` with the correct cross-compiler
+> and pointing `audiopus_sys` to it via `OPUS_LIB_DIR`.
 
 ### Prerequisites (Linux — Arch/Manjaro)
 
@@ -198,35 +203,45 @@ rustup target add x86_64-pc-windows-gnu
 # mingw-w64 toolchain
 sudo pacman -S mingw-w64-gcc
 
-# Build tools that audiopus_sys needs to compile libopus from source
-sudo pacman -S base-devel autoconf automake libtool cmake
+# Build tools for libopus
+sudo pacman -S base-devel autoconf automake libtool
 ```
 
 <details><summary>Ubuntu/Debian prerequisites</summary>
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
-sudo apt install mingw-w64 build-essential autoconf automake libtool cmake pkg-config
+sudo apt install mingw-w64 build-essential autoconf automake libtool pkg-config
 ```
 
 </details>
 
 ### Configure Cargo for cross-compilation
 
-```bash
-mkdir -p .cargo
-cat > .cargo/config.toml << 'EOF'
+Create `.cargo/config.toml` (already included in this repo):
+
+```toml
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-gcc-ar"
-EOF
 ```
 
-### Build
+### Step 1 — Build libopus for Windows
+
+The included helper script downloads, cross-compiles, and installs libopus
+into `./opus-win64/`:
 
 ```bash
-# Static-link libopus into the binary (recommended for distribution)
-LIBOPUS_STATIC=1 cargo build \
+./scripts/build-opus-win64.sh
+```
+
+This only needs to run once (or when you want a newer Opus version).
+
+### Step 2 — Build the Rust binary
+
+```bash
+OPUS_LIB_DIR=$PWD/opus-win64/lib LIBOPUS_STATIC=1 \
+  cargo build \
     --manifest-path src-tauri/Cargo.toml \
     --target x86_64-pc-windows-gnu \
     --release

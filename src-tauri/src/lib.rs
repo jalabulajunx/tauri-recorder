@@ -23,6 +23,14 @@ mod windows_audio {
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
 
+    /// Which audio stream to capture.
+    pub enum CaptureMode {
+        /// System audio output (what plays through speakers/headphones).
+        Loopback,
+        /// Default microphone input.
+        Microphone,
+    }
+
     // Thread-safe capture using raw pointers
     pub struct ThreadSafeCapture {
         audio_client: AtomicPtr<std::ffi::c_void>,
@@ -36,19 +44,24 @@ mod windows_audio {
     unsafe impl Sync for ThreadSafeCapture {}
 
     impl ThreadSafeCapture {
-        pub fn new() -> Result<Self, String> {
+        pub fn new(mode: CaptureMode) -> Result<Self, String> {
             unsafe {
-                // Initialize COM
+                // Initialize COM (S_FALSE if already initialised — that's fine)
                 CoInitializeEx(None, COINIT_MULTITHREADED).ok()
                     .map_err(|e| format!("COM initialization failed: {}", e))?;
 
-                // Get default audio endpoint (render device for loopback)
                 let enumerator: IMMDeviceEnumerator =
                     CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                         .map_err(|e| format!("Failed to create device enumerator: {}", e))?;
 
+                // Pick endpoint + stream flags based on mode
+                let (data_flow, stream_flags) = match mode {
+                    CaptureMode::Loopback   => (eRender,  AUDCLNT_STREAMFLAGS_LOOPBACK),
+                    CaptureMode::Microphone => (eCapture, 0u32),
+                };
+
                 let device = enumerator
-                    .GetDefaultAudioEndpoint(eRender, eConsole)
+                    .GetDefaultAudioEndpoint(data_flow, eConsole)
                     .map_err(|e| format!("Failed to get default audio endpoint: {}", e))?;
 
                 // Activate audio client
@@ -65,8 +78,6 @@ mod windows_audio {
                 let sample_rate = format.nSamplesPerSec;
                 let channels = format.nChannels;
 
-                // Initialize audio client for loopback capture
-                let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
                 let duration = 10_000_000;
 
                 audio_client
@@ -204,9 +215,9 @@ mod windows_audio {
 }
 
 #[cfg(windows)]
-use windows_audio::ThreadSafeCapture;
+use windows_audio::{ThreadSafeCapture, CaptureMode};
 
-/// Start recording system audio (loopback capture)
+/// Start recording system audio (loopback + microphone)
 #[tauri::command]
 async fn start_recording(app: tauri::AppHandle) -> Result<String, String> {
     if RECORDING.load(Ordering::SeqCst) {
@@ -219,15 +230,33 @@ async fn start_recording(app: tauri::AppHandle) -> Result<String, String> {
         AUDIO_BUFFER.lock().clear();
         *RECORDING_START.lock() = Some(Instant::now());
 
-        // Initialize WASAPI loopback capture
-        let capture = ThreadSafeCapture::new()?;
-        let (sample_rate, channels) = capture.get_format();
+        // Initialize WASAPI loopback capture (speakers → remote person's voice)
+        let loopback = ThreadSafeCapture::new(CaptureMode::Loopback)?;
+        let (sample_rate, channels) = loopback.get_format();
         *SAMPLE_RATE.lock() = sample_rate;
         *CHANNELS.lock() = channels;
 
-        capture.start()?;
+        // Initialize microphone capture (local person's voice)
+        let mic = match ThreadSafeCapture::new(CaptureMode::Microphone) {
+            Ok(m) => {
+                eprintln!("Microphone capture initialised: {} Hz, {} ch",
+                          m.get_format().0, m.get_format().1);
+                Some(m)
+            }
+            Err(e) => {
+                eprintln!("WARNING: Could not open microphone — only loopback will be recorded: {}", e);
+                None
+            }
+        };
+
+        loopback.start()?;
+        if let Some(ref m) = mic { m.start()?; }
+
         RECORDING.store(true, Ordering::SeqCst);
         PAUSED.store(false, Ordering::SeqCst);
+
+        let loopback_channels = channels;
+        let has_mic = mic.is_some();
 
         // Spawn recording thread
         let app_handle = app.clone();
@@ -238,30 +267,50 @@ async fn start_recording(app: tauri::AppHandle) -> Result<String, String> {
                 }
 
                 if !PAUSED.load(Ordering::SeqCst) {
-                    match capture.read_buffer() {
-                        Ok(samples) => {
-                            if !samples.is_empty() {
-                                AUDIO_BUFFER.lock().extend(samples);
-                            }
+                    // Read loopback (speaker output — remote voice)
+                    let loopback_samples = match loopback.read_buffer() {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("Loopback read error: {}", e); vec![] }
+                    };
+
+                    // Read microphone (local voice)
+                    let mic_samples = if let Some(ref m) = mic {
+                        match m.read_buffer() {
+                            Ok(s) => s,
+                            Err(e) => { eprintln!("Mic read error: {}", e); vec![] }
                         }
-                        Err(e) => {
-                            eprintln!("Error reading buffer: {}", e);
-                        }
+                    } else {
+                        vec![]
+                    };
+
+                    // Mix: sum the two streams sample-by-sample.
+                    // If mic has a different channel count, up/down-mix naively.
+                    let mic_ch = mic.as_ref().map(|m| m.get_format().1).unwrap_or(loopback_channels);
+
+                    if !loopback_samples.is_empty() || !mic_samples.is_empty() {
+                        let mixed = mix_streams(
+                            &loopback_samples, loopback_channels,
+                            &mic_samples, mic_ch,
+                            loopback_channels,
+                        );
+                        AUDIO_BUFFER.lock().extend(mixed);
                     }
                 }
 
                 std::thread::sleep(Duration::from_millis(10));
             }
 
-            let _ = capture.stop();
+            let _ = loopback.stop();
+            if let Some(ref m) = mic { let _ = m.stop(); }
 
             // Emit recording stopped event
             let _ = app_handle.emit("recording-stopped", ());
         });
 
+        let mic_status = if has_mic { "+ mic" } else { "(no mic)" };
         Ok(format!(
-            "Recording started at {} Hz, {} channels",
-            sample_rate, channels
+            "Recording started at {} Hz, {} ch, loopback {}",
+            sample_rate, channels, mic_status
         ))
     }
 
@@ -270,6 +319,58 @@ async fn start_recording(app: tauri::AppHandle) -> Result<String, String> {
         let _ = app;
         Err("This application only works on Windows".to_string())
     }
+}
+
+/// Mix two interleaved f32 PCM streams into one.
+/// If channel counts differ, mono→stereo is duplicated, stereo→mono is averaged.
+fn mix_streams(
+    a: &[f32], a_ch: u16,
+    b: &[f32], b_ch: u16,
+    out_ch: u16,
+) -> Vec<f32> {
+    let a_frames = if a_ch > 0 { a.len() / a_ch as usize } else { 0 };
+    let b_frames = if b_ch > 0 { b.len() / b_ch as usize } else { 0 };
+    let out_frames = a_frames.max(b_frames);
+    let oc = out_ch as usize;
+    let mut out = Vec::with_capacity(out_frames * oc);
+
+    for f in 0..out_frames {
+        for c in 0..oc {
+            // Get sample from stream A
+            let sa = if f < a_frames {
+                if a_ch as usize == oc {
+                    a[f * a_ch as usize + c]
+                } else if a_ch == 1 {
+                    a[f] // mono → replicate to every output channel
+                } else {
+                    // stereo → mono: average
+                    let sum: f32 = (0..a_ch as usize).map(|k| a[f * a_ch as usize + k]).sum();
+                    sum / a_ch as f32
+                }
+            } else {
+                0.0
+            };
+
+            // Get sample from stream B
+            let sb = if f < b_frames {
+                if b_ch as usize == oc {
+                    b[f * b_ch as usize + c]
+                } else if b_ch == 1 {
+                    b[f]
+                } else {
+                    let sum: f32 = (0..b_ch as usize).map(|k| b[f * b_ch as usize + k]).sum();
+                    sum / b_ch as f32
+                }
+            } else {
+                0.0
+            };
+
+            // Sum and soft-clamp to [-1, 1]
+            out.push((sa + sb).clamp(-1.0, 1.0));
+        }
+    }
+
+    out
 }
 
 /// Stop recording and save to file
