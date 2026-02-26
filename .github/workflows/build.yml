@@ -21,9 +21,6 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       
-      - name: Install opus via chocolatey
-        run: choco install opus -y
-      
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -40,9 +37,13 @@ jobs:
       
       - name: Build release (MSI)
         run: npm run tauri build -- --bundles msi
+        env:
+          LIBOPUS_STATIC: '1'
 
       - name: Build release (NSIS)
         run: npm run tauri build -- --bundles nsis
+        env:
+          LIBOPUS_STATIC: '1'
 
       - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
